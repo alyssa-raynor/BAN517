@@ -845,8 +845,185 @@ def calculate_periodic_review(
     }
 
 
-# Backwards compatibility alias
-calculate_fixed_period_review = calculate_periodic_review
+# ---------------------------------------------------------------------------
+# 6. Multicriteria Inventory Classification (A, B, C, D) using Sales & Hits
+# ---------------------------------------------------------------------------
+def classify_inventory_multicriteria(
+    df,
+    sales_col: str = "Sales ($)",
+    hits_col: str = "Hits",
+    item_num_col: str = "Item Number",
+    item_name_col: str = "Item Name",
+    uom_col: str = "UoM",
+    a_cutoff: float = 0.80,
+    b_cutoff: float = 0.95,
+) -> Dict[str, Any]:
+    """
+    Perform 2D Multicriteria Inventory Classification (A, B, C, D) using
+    Financial Volume (Sales) and Operational Pick Velocity (Hits).
+
+    Parameters:
+        df: pandas DataFrame containing inventory records
+        sales_col: column name for sales volume
+        hits_col: column name for pick/transaction frequency
+        a_cutoff: cumulative Pareto boundary for Class A (default 80%)
+        b_cutoff: cumulative Pareto boundary for Class B (default 95%)
+
+    Classification Logic:
+        - Sales Dimension:
+            * Class A: Top ~80% cumulative sales
+            * Class B: Next ~15% (80% to 95%)
+            * Class C: Remaining sales > 0 (95% to 100%)
+            * Class D: 0 Sales (obsolete / dead)
+        - Hits Dimension:
+            * Class A: Top ~80% cumulative hits
+            * Class B: Next ~15% (80% to 95%)
+            * Class C: Remaining hits > 0 (95% to 100%)
+            * Class D: 0 Hits (no pick activity)
+        - Multicriteria Matrix:
+            * Class A: AA, AB, BA (Critical high-revenue or high-pick items)
+            * Class B: BB, AC, CA (Moderate revenue and moderate velocity)
+            * Class C: BC, CB, CC (Low revenue, low velocity)
+            * Class D: Any item with 0 sales/hits or DD, CD, DC (Dead/dormant)
+    """
+    import pandas as pd
+
+    data = df.copy()
+
+    # Find matching sales and hits column names flexibly
+    matched_sales = None
+    for c in [sales_col, "Sales ($)", "Sales", "Revenue", "Annual Sales"]:
+        if c in data.columns:
+            matched_sales = c
+            break
+    if not matched_sales:
+        raise ValueError(f"Required sales column not found. Looked for '{sales_col}'. Available: {list(data.columns)}")
+
+    matched_hits = None
+    for c in [hits_col, "Hits", "Pick Frequency", "Transactions", "Orders"]:
+        if c in data.columns:
+            matched_hits = c
+            break
+    if not matched_hits:
+        raise ValueError(f"Required hits column not found. Looked for '{hits_col}'. Available: {list(data.columns)}")
+
+    # Ensure clean numeric columns
+    data[matched_sales] = pd.to_numeric(data[matched_sales], errors="coerce").fillna(0.0)
+    data[matched_hits] = pd.to_numeric(data[matched_hits], errors="coerce").fillna(0.0)
+
+    total_sales = data[matched_sales].sum()
+    total_hits = data[matched_hits].sum()
+
+    # --- 1. Sales Pareto Classification ---
+    if total_sales > 0:
+        data = data.sort_values(by=matched_sales, ascending=False).reset_index(drop=True)
+        data["Cum_Sales"] = data[matched_sales].cumsum()
+        data["Cum_Sales_Pct"] = data["Cum_Sales"] / total_sales
+        data["Sales_Share_Pct"] = (data[matched_sales] / total_sales) * 100.0
+
+        def _get_sales_class(row):
+            if row[matched_sales] <= 0:
+                return "D"
+            if row["Cum_Sales_Pct"] <= a_cutoff or (row["Cum_Sales_Pct"] - (row[matched_sales] / total_sales)) < a_cutoff:
+                return "A"
+            elif row["Cum_Sales_Pct"] <= b_cutoff:
+                return "B"
+            else:
+                return "C"
+
+        data["Sales Class"] = data.apply(_get_sales_class, axis=1)
+    else:
+        data["Sales Class"] = "D"
+        data["Sales_Share_Pct"] = 0.0
+
+    # --- 2. Hits Pareto Classification ---
+    if total_hits > 0:
+        data = data.sort_values(by=matched_hits, ascending=False).reset_index(drop=True)
+        data["Cum_Hits"] = data[matched_hits].cumsum()
+        data["Cum_Hits_Pct"] = data["Cum_Hits"] / total_hits
+        data["Hits_Share_Pct"] = (data[matched_hits] / total_hits) * 100.0
+
+        def _get_hits_class(row):
+            if row[matched_hits] <= 0:
+                return "D"
+            if row["Cum_Hits_Pct"] <= a_cutoff or (row["Cum_Hits_Pct"] - (row[matched_hits] / total_hits)) < a_cutoff:
+                return "A"
+            elif row["Cum_Hits_Pct"] <= b_cutoff:
+                return "B"
+            else:
+                return "C"
+
+        data["Hits Class"] = data.apply(_get_hits_class, axis=1)
+    else:
+        data["Hits Class"] = "D"
+        data["Hits_Share_Pct"] = 0.0
+
+    # --- 3. 2D Multicriteria Matrix Synthesis into A, B, C, D ---
+    # Matrix definition:
+    # AA, AB, BA -> Class A
+    # BB, AC, CA -> Class B
+    # BC, CB, CC -> Class C
+    # Anything with D or zero activity -> Class D
+    matrix_map = {
+        ("A", "A"): "A",
+        ("A", "B"): "A",
+        ("B", "A"): "A",
+        ("B", "B"): "B",
+        ("A", "C"): "B",
+        ("C", "A"): "B",
+        ("B", "C"): "C",
+        ("C", "B"): "C",
+        ("C", "C"): "C",
+        ("A", "D"): "B",
+        ("D", "A"): "B",
+        ("B", "D"): "C",
+        ("D", "B"): "C",
+        ("C", "D"): "D",
+        ("D", "C"): "D",
+        ("D", "D"): "D",
+    }
+
+    data["Matrix Pair"] = data["Sales Class"] + data["Hits Class"]
+    data["Final Class"] = data.apply(lambda r: matrix_map.get((r["Sales Class"], r["Hits Class"]), "C"), axis=1)
+
+    # Sort final dataframe by Final Class (A->B->C->D) then Sales descending
+    class_order = {"A": 1, "B": 2, "C": 3, "D": 4}
+    data["_rank"] = data["Final Class"].map(class_order)
+    data = data.sort_values(by=["_rank", matched_sales], ascending=[True, False]).drop(columns=["_rank"]).reset_index(drop=True)
+
+    # --- 4. Class Distribution Summary ---
+    summary_by_class = []
+    total_items = len(data)
+    for cl in ["A", "B", "C", "D"]:
+        subset = data[data["Final Class"] == cl]
+        cnt = len(subset)
+        c_sales = subset[matched_sales].sum()
+        c_hits = subset[matched_hits].sum()
+        summary_by_class.append({
+            "Class": cl,
+            "Item Count": cnt,
+            "Percent of Items": round((cnt / total_items * 100.0) if total_items > 0 else 0.0, 1),
+            "Total Sales ($)": round(c_sales, 2),
+            "Percent of Sales": round((c_sales / total_sales * 100.0) if total_sales > 0 else 0.0, 1),
+            "Total Hits": int(c_hits),
+            "Percent of Hits": round((c_hits / total_hits * 100.0) if total_hits > 0 else 0.0, 1),
+        })
+
+    summary_df = pd.DataFrame(summary_by_class)
+
+    # Clean intermediate calculation columns for public presentation
+    clean_display_df = data.drop(columns=["Cum_Sales", "Cum_Sales_Pct", "Cum_Hits", "Cum_Hits_Pct"], errors="ignore")
+
+    return {
+        "classified_df": clean_display_df,
+        "summary_by_class": summary_df,
+        "total_items": total_items,
+        "total_sales": round(total_sales, 2),
+        "total_hits": int(total_hits),
+        "sales_column": matched_sales,
+        "hits_column": matched_hits,
+    }
+
 
 
 # ---------------------------------------------------------------------------

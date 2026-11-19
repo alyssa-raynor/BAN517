@@ -341,29 +341,98 @@ def run_streamlit_app():
                 st.json(inputs)
 
     # =======================================================================
-    # CSV Data Upload & Inventory Portfolio Analysis Section
+    # CSV Data Upload & Inventory Analytics Section (Single File Uploader)
     # =======================================================================
     if uploaded_csv is not None:
         st.markdown("---")
-        st.header("📊 Inventory Dataset Processing & Portfolio Analysis")
-
         try:
-            # 1. Read CSV into a pandas dataframe
+            # Read CSV into a pandas dataframe
             df = pd.read_csv(uploaded_csv)
 
-            # 2. Validate required columns
-            required_cols = ["Product", "Category", "Units", "Unit Cost"]
-            missing_cols = [col for col in required_cols if col not in df.columns]
+            # Detect which analysis capabilities match the uploaded schema
+            has_classification_schema = any(c in df.columns for c in ["Sales ($)", "Sales", "Revenue"]) and any(c in df.columns for c in ["Hits", "Pick Frequency", "Transactions"])
+            has_portfolio_schema = all(c in df.columns for c in ["Product", "Category", "Units", "Unit Cost"])
 
-            if missing_cols:
-                # 3. Clear error message identifying missing columns
-                st.error(
-                    f"⚠️ Missing Required Column(s): **{', '.join(missing_cols)}**.\n\n"
-                    f"The uploaded CSV must contain the following columns: **{', '.join(required_cols)}**."
+            # ---------------------------------------------------------------
+            # 1. MULTICRITERIA INVENTORY CLASSIFICATION (A, B, C, D)
+            # ---------------------------------------------------------------
+            if has_classification_schema:
+                st.header("🏷️ Multicriteria Inventory Classification (Classes A, B, C, D)")
+                st.caption("Classification based on 2D Pareto synthesis of Financial Volume (Sales) and Operational Activity (Hits).")
+
+                # Dataset profile
+                meta_c1, meta_c2, meta_c3 = st.columns(3)
+                meta_c1.metric("Total Items (Rows)", f"{df.shape[0]:,}")
+                meta_c2.metric("Total Attributes (Columns)", f"{df.shape[1]:,}")
+                meta_c3.write(f"**Columns Recognized:**\n`{', '.join(df.columns)}`")
+
+                # Perform multicriteria classification using pandas
+                import inventory_tools
+                classif_result = inventory_tools.classify_inventory_multicriteria(df)
+                classified_df = classif_result["classified_df"]
+                summary_df = classif_result["summary_by_class"]
+                sales_col = classif_result["sales_column"]
+                hits_col = classif_result["hits_column"]
+
+                # Display high-level class summary metrics
+                st.subheader("🎯 Classification Class Breakdown")
+                m_c1, m_c2, m_c3, m_c4 = st.columns(4)
+
+                def _get_class_count(cl_name):
+                    row = summary_df[summary_df["Class"] == cl_name]
+                    return int(row["Item Count"].values[0]) if len(row) > 0 else 0
+
+                def _get_class_sales_pct(cl_name):
+                    row = summary_df[summary_df["Class"] == cl_name]
+                    return float(row["Percent of Sales"].values[0]) if len(row) > 0 else 0.0
+
+                m_c1.metric("Class A (Critical / High-Velocity)", f"{_get_class_count('A'):,} items", f"{_get_class_sales_pct('A'):.1f}% of Sales")
+                m_c2.metric("Class B (Moderate Velocity)", f"{_get_class_count('B'):,} items", f"{_get_class_sales_pct('B'):.1f}% of Sales")
+                m_c3.metric("Class C (Low Velocity)", f"{_get_class_count('C'):,} items", f"{_get_class_sales_pct('C'):.1f}% of Sales")
+                m_c4.metric("Class D (Dead / Dormant Stock)", f"{_get_class_count('D'):,} items", f"{_get_class_sales_pct('D'):.1f}% of Sales")
+
+                # Display Class Summary Table and Chart
+                ch_col1, ch_col2 = st.columns([1, 1])
+                with ch_col1:
+                    st.markdown("**Summary Distribution by Class**")
+                    st.dataframe(
+                        summary_df.style.format({
+                            "Percent of Items": "{:.1f}%",
+                            "Total Sales ($)": "${:,.2f}",
+                            "Percent of Sales": "{:.1f}%",
+                            "Total Hits": "{:,.0f}",
+                            "Percent of Hits": "{:.1f}%",
+                        }),
+                        use_container_width=True
+                    )
+                with ch_col2:
+                    st.markdown("**Item Count & Sales Distribution**")
+                    chart_class_data = summary_df.set_index("Class")[["Percent of Items", "Percent of Sales"]]
+                    st.bar_chart(chart_class_data)
+
+                # Display Enriched DataFrame with A, B, C, D results
+                st.subheader("📋 Enriched Inventory Data with Classification Results")
+                
+                # Format dataframe for display
+                format_dict = {
+                    sales_col: "${:,.2f}",
+                    hits_col: "{:,.0f}",
+                }
+                if "Sales_Share_Pct" in classified_df.columns:
+                    format_dict["Sales_Share_Pct"] = "{:.2f}%"
+                if "Hits_Share_Pct" in classified_df.columns:
+                    format_dict["Hits_Share_Pct"] = "{:.2f}%"
+
+                st.dataframe(
+                    classified_df.style.format(format_dict),
+                    use_container_width=True
                 )
-            else:
-                # 4 & 5. Display dataset profile (rows, columns, column names)
-                st.success("✅ CSV uploaded and validated successfully!")
+
+            # ---------------------------------------------------------------
+            # 2. PORTFOLIO & INVENTORY VALUE ANALYSIS (Existing Capability)
+            # ---------------------------------------------------------------
+            if has_portfolio_schema:
+                st.header("📊 Inventory Portfolio & Valuation Analysis")
                 
                 col_meta1, col_meta2, col_meta3 = st.columns(3)
                 col_meta1.metric("Number of Rows", f"{df.shape[0]:,}")
@@ -371,17 +440,12 @@ def run_streamlit_app():
                 col_meta3.write(f"**Column Names:**\n`{', '.join(df.columns)}`")
 
                 # DATA ANALYSIS using pandas
-                # Ensure numerical types for Units and Unit Cost
                 df["Units"] = pd.to_numeric(df["Units"], errors="coerce").fillna(0)
                 df["Unit Cost"] = pd.to_numeric(df["Unit Cost"], errors="coerce").fillna(0.0)
 
-                # 1. Calculate total Units
                 total_units = df["Units"].sum()
-
-                # 2. Calculate average Unit Cost
                 avg_unit_cost = df["Unit Cost"].mean() if len(df) > 0 else 0.0
 
-                # 3. Identify Product with the highest Units
                 if len(df) > 0:
                     highest_idx = df["Units"].idxmax()
                     highest_product = df.loc[highest_idx, "Product"]
@@ -390,15 +454,11 @@ def run_streamlit_app():
                 else:
                     highest_display = "N/A (Empty dataset)"
 
-                # 4. Group data by Category and calculate total Units for each Category
                 category_units = df.groupby("Category")["Units"].sum().reset_index()
                 category_units.columns = ["Category", "Total Units"]
                 category_units = category_units.sort_values(by="Total Units", ascending=False)
 
-                # 5. Create calculated column: Inventory Value = Units * Unit Cost
                 df["Inventory Value"] = df["Units"] * df["Unit Cost"]
-
-                # 6. Calculate total Inventory Value across all products
                 total_inventory_val = df["Inventory Value"].sum()
 
                 # RESULTS DISPLAY
@@ -409,7 +469,6 @@ def run_streamlit_app():
                 res_col3.metric("Product with Highest Units", highest_display)
                 res_col4.metric("Total Inventory Value", f"${total_inventory_val:,.2f}")
 
-                # Total Units by Category
                 st.subheader("🏷️ Total Units by Category")
                 cat_col1, cat_col2 = st.columns([1, 1])
                 with cat_col1:
@@ -420,7 +479,6 @@ def run_streamlit_app():
                 with cat_col2:
                     st.bar_chart(category_units.set_index("Category")["Total Units"])
 
-                # Display the complete dataframe including the new Inventory Value column
                 st.subheader("📋 Enriched Inventory Dataset (with Inventory Value)")
                 display_df = df.copy()
                 formatted_df = display_df.style.format({
@@ -429,6 +487,14 @@ def run_streamlit_app():
                     "Inventory Value": "${:,.2f}",
                 })
                 st.dataframe(formatted_df, use_container_width=True)
+
+            # Neither schema detected
+            if not has_classification_schema and not has_portfolio_schema:
+                st.warning(
+                    f"⚠️ The uploaded CSV columns `{list(df.columns)}` did not match the expected formats:\n\n"
+                    "- **Classification Format**: `Item Number`, `Item Name`, `UoM`, `Sales ($)`, `Hits`\n"
+                    "- **Portfolio Analysis Format**: `Product`, `Category`, `Units`, `Unit Cost`"
+                )
 
         except Exception as e:
             st.error(f"❌ Error processing uploaded CSV file: {str(e)}")
